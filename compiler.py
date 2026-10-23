@@ -43,6 +43,42 @@ def main() -> None:
                 if entry["entry"] == kernel.name
             )
             print(emit_signature(kernel.name, kernel_meta["arg_order"]))
+            print("{")
+            for argument in kernel_meta["arg_order"]:
+                print(f"    .reg .b64 %ptr_{argument};")
+            for axis in ("x", "y", "z"):
+                print(f"    .reg .b32 %thread_{axis};")
+            for axis in ("x", "y", "z"):
+                print(f"    .reg .b32 %block_{axis};")
+            for axis in ("x", "y", "z"):
+                print(f"    .reg .b32 %block_size_{axis};")
+            print("    .reg .b32 %thread_linear;")
+            print("    .reg .b32 %block_linear;")
+            print("    .reg .b32 %threads_per_block;")
+            print("    .reg .b32 %global_linear;")
+            for axis in ("x", "y", "z"):
+                print(f"    .reg .b32 %grid_size_{axis};")
+            for argument in kernel_meta["arg_order"]:
+                print(f"    ld.param.u64 %ptr_{argument}, [param_{argument}];")
+            for argument in kernel_meta["arg_order"]:
+                print(f"    cvta.to.global.u64 %ptr_{argument}, %ptr_{argument};")
+            for axis in ("x", "y", "z"):
+                print(f"    mov.u32 %thread_{axis}, %tid.{axis};")
+            for axis in ("x", "y", "z"):
+                print(f"    mov.u32 %block_{axis}, %ctaid.{axis};")
+            for axis in ("x", "y", "z"):
+                print(f"    mov.u32 %block_size_{axis}, %ntid.{axis};")
+            for axis in ("x", "y", "z"):
+                print(f"    mov.u32 %grid_size_{axis}, %nctaid.{axis};")
+            print("    mad.lo.u32 %thread_linear, %block_size_y, %thread_z, %thread_y;")
+            print("    mad.lo.u32 %thread_linear, %block_size_x, %thread_linear, %thread_x;")
+            print("    mad.lo.u32 %block_linear, %grid_size_y, %block_z, %block_y;")
+            print("    mad.lo.u32 %block_linear, %grid_size_x, %block_linear, %block_x;")
+            print("    mul.lo.u32 %threads_per_block, %block_size_x, %block_size_y;")
+            print("    mul.lo.u32 %threads_per_block, %threads_per_block, %block_size_z;")
+            print("    mad.lo.u32 %global_linear, %block_linear, %threads_per_block, %thread_linear;")
+            print("    ret;")
+            print("}")
             print(f"Parameter order: {kernel_meta['arg_order']}", file=sys.stderr)
             print(f"Inputs: {node.inputs}", file=sys.stderr)
             for output in node.outputs:
