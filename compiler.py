@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from emmy.compiler.graph import Graph
-from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.ir.kernel.ir import KernelOp, Tile
 
 
 def load_graph(path: Path) -> Graph:
@@ -24,6 +24,15 @@ def emit_signature(name: str, arg_order: list[str]) -> str:
         f"    .param .u64 param_{argument}" for argument in arg_order
     )
     return f".visible .entry {name}(\n{parameters}\n)"
+
+
+def axis_strides(tile: Tile) -> list[int]:
+    strides = []
+    stride = 1
+    for axis in reversed(tile.axes):
+        strides.append(stride)
+        stride *= axis.extent.value
+    return list(reversed(strides))
 
 
 def main() -> None:
@@ -58,6 +67,10 @@ def main() -> None:
             print("    .reg .b32 %global_linear;")
             for axis in ("x", "y", "z"):
                 print(f"    .reg .b32 %grid_size_{axis};")
+            for statement in kernel.body:
+                if isinstance(statement, Tile):
+                    for axis in statement.axes:
+                        print(f"    .reg .b32 %axis_{axis.name};")
             for argument in kernel_meta["arg_order"]:
                 print(f"    ld.param.u64 %ptr_{argument}, [param_{argument}];")
             for argument in kernel_meta["arg_order"]:
@@ -77,6 +90,11 @@ def main() -> None:
             print("    mul.lo.u32 %threads_per_block, %block_size_x, %block_size_y;")
             print("    mul.lo.u32 %threads_per_block, %threads_per_block, %block_size_z;")
             print("    mad.lo.u32 %global_linear, %block_linear, %threads_per_block, %thread_linear;")
+            for statement in kernel.body:
+                if isinstance(statement, Tile):
+                    for axis, stride in zip(statement.axes, axis_strides(statement)):
+                        print(f"    div.u32 %axis_{axis.name}, %global_linear, {stride};")
+                        print(f"    rem.u32 %axis_{axis.name}, %axis_{axis.name}, {axis.extent.value};")
             print("    ret;")
             print("}")
             print(f"Parameter order: {kernel_meta['arg_order']}", file=sys.stderr)
@@ -88,6 +106,12 @@ def main() -> None:
                 )
             for statement in kernel.body:
                 print(type(statement).__name__, file=sys.stderr)
+                if isinstance(statement, Tile):
+                    for axis, stride in zip(statement.axes, axis_strides(statement)):
+                        print(
+                            f"Axis: {axis.name}, extent={axis.extent}, stride={stride}",
+                            file=sys.stderr,
+                        )
             print(kernel.name, file=sys.stderr)
     print(f"Loaded graph with {len(graph.nodes)} nodes", file=sys.stderr)
 
