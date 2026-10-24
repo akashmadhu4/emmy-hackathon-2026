@@ -35,6 +35,36 @@ def axis_strides(tile: Tile) -> list[int]:
     return list(reversed(strides))
 
 
+def tile_size(tile: Tile) -> int:
+    size = 1
+    for axis in tile.axes:
+        size *= axis.extent.value
+    return size
+
+
+def allocate_value(name: str, registers: dict[str, str]) -> str:
+    if name not in registers:
+        registers[name] = f"%value_{len(registers)}"
+    return registers[name]
+
+
+class KernelContext:
+    def __init__(self) -> None:
+        self.declarations: list[str] = []
+        self.instructions: list[str] = []
+
+    def emit(self, instruction: str) -> None:
+        self.instructions.append(instruction)
+
+    def declare(self, declaration: str) -> None:
+        self.declarations.append(declaration)
+
+    def render_body(self) -> str:
+        lines = self.declarations + self.instructions
+        body = "\n".join(f"    {line}" for line in lines)
+        return "{\n" + body + "\n}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ir_path", type=Path, help="Path to a Kernel IR JSON file")
@@ -47,56 +77,61 @@ def main() -> None:
     for node in graph.nodes.values():
         if isinstance(node.op, KernelOp):
             kernel = node.op
+            context = KernelContext()
+            value_registers: dict[str, str] = {}
             kernel_meta = next(
                 entry for entry in metadata["kernels"]
                 if entry["entry"] == kernel.name
             )
             print(emit_signature(kernel.name, kernel_meta["arg_order"]))
-            print("{")
             for argument in kernel_meta["arg_order"]:
-                print(f"    .reg .b64 %ptr_{argument};")
+                context.declare(f".reg .b64 %ptr_{argument};")
             for axis in ("x", "y", "z"):
-                print(f"    .reg .b32 %thread_{axis};")
+                context.declare(f".reg .b32 %thread_{axis};")
             for axis in ("x", "y", "z"):
-                print(f"    .reg .b32 %block_{axis};")
+                context.declare(f".reg .b32 %block_{axis};")
             for axis in ("x", "y", "z"):
-                print(f"    .reg .b32 %block_size_{axis};")
-            print("    .reg .b32 %thread_linear;")
-            print("    .reg .b32 %block_linear;")
-            print("    .reg .b32 %threads_per_block;")
-            print("    .reg .b32 %global_linear;")
+                context.declare(f".reg .b32 %block_size_{axis};")
+            context.declare(".reg .b32 %thread_linear;")
+            context.declare(".reg .b32 %block_linear;")
+            context.declare(".reg .b32 %threads_per_block;")
+            context.declare(".reg .b32 %global_linear;")
             for axis in ("x", "y", "z"):
-                print(f"    .reg .b32 %grid_size_{axis};")
+                context.declare(f".reg .b32 %grid_size_{axis};")
             for statement in kernel.body:
                 if isinstance(statement, Tile):
+                    context.declare(".reg .pred %outside_tile;")
                     for axis in statement.axes:
-                        print(f"    .reg .b32 %axis_{axis.name};")
+                        context.declare(f".reg .b32 %axis_{axis.name};")
             for argument in kernel_meta["arg_order"]:
-                print(f"    ld.param.u64 %ptr_{argument}, [param_{argument}];")
+                context.emit(f"ld.param.u64 %ptr_{argument}, [param_{argument}];")
             for argument in kernel_meta["arg_order"]:
-                print(f"    cvta.to.global.u64 %ptr_{argument}, %ptr_{argument};")
+                context.emit(f"cvta.to.global.u64 %ptr_{argument}, %ptr_{argument};")
             for axis in ("x", "y", "z"):
-                print(f"    mov.u32 %thread_{axis}, %tid.{axis};")
+                context.emit(f"mov.u32 %thread_{axis}, %tid.{axis};")
             for axis in ("x", "y", "z"):
-                print(f"    mov.u32 %block_{axis}, %ctaid.{axis};")
+                context.emit(f"mov.u32 %block_{axis}, %ctaid.{axis};")
             for axis in ("x", "y", "z"):
-                print(f"    mov.u32 %block_size_{axis}, %ntid.{axis};")
+                context.emit(f"mov.u32 %block_size_{axis}, %ntid.{axis};")
             for axis in ("x", "y", "z"):
-                print(f"    mov.u32 %grid_size_{axis}, %nctaid.{axis};")
-            print("    mad.lo.u32 %thread_linear, %block_size_y, %thread_z, %thread_y;")
-            print("    mad.lo.u32 %thread_linear, %block_size_x, %thread_linear, %thread_x;")
-            print("    mad.lo.u32 %block_linear, %grid_size_y, %block_z, %block_y;")
-            print("    mad.lo.u32 %block_linear, %grid_size_x, %block_linear, %block_x;")
-            print("    mul.lo.u32 %threads_per_block, %block_size_x, %block_size_y;")
-            print("    mul.lo.u32 %threads_per_block, %threads_per_block, %block_size_z;")
-            print("    mad.lo.u32 %global_linear, %block_linear, %threads_per_block, %thread_linear;")
+                context.emit(f"mov.u32 %grid_size_{axis}, %nctaid.{axis};")
+            context.emit("mad.lo.u32 %thread_linear, %block_size_y, %thread_z, %thread_y;")
+            context.emit("mad.lo.u32 %thread_linear, %block_size_x, %thread_linear, %thread_x;")
+            context.emit("mad.lo.u32 %block_linear, %grid_size_y, %block_z, %block_y;")
+            context.emit("mad.lo.u32 %block_linear, %grid_size_x, %block_linear, %block_x;")
+            context.emit("mul.lo.u32 %threads_per_block, %block_size_x, %block_size_y;")
+            context.emit("mul.lo.u32 %threads_per_block, %threads_per_block, %block_size_z;")
+            context.emit("mad.lo.u32 %global_linear, %block_linear, %threads_per_block, %thread_linear;")
             for statement in kernel.body:
                 if isinstance(statement, Tile):
+                    context.emit(f"setp.ge.u32 %outside_tile, %global_linear, {tile_size(statement)};")
+                    context.emit("@%outside_tile bra TILE_END;")
                     for axis, stride in zip(statement.axes, axis_strides(statement)):
-                        print(f"    div.u32 %axis_{axis.name}, %global_linear, {stride};")
-                        print(f"    rem.u32 %axis_{axis.name}, %axis_{axis.name}, {axis.extent.value};")
-            print("    ret;")
-            print("}")
+                        context.emit(f"div.u32 %axis_{axis.name}, %global_linear, {stride};")
+                        context.emit(f"rem.u32 %axis_{axis.name}, %axis_{axis.name}, {axis.extent.value};")
+                    context.emit("TILE_END:")
+            context.emit("ret;")
+            print(context.render_body())
             print(f"Parameter order: {kernel_meta['arg_order']}", file=sys.stderr)
             print(f"Inputs: {node.inputs}", file=sys.stderr)
             for output in node.outputs:
