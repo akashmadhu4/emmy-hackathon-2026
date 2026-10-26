@@ -119,17 +119,32 @@ def emit_load(statement: Load, context: KernelContext) -> None:
 
 def emit_assign(statement: Assign, context: KernelContext) -> None:
     if (
-        statement.op.name != "add"
+        statement.op.name == "relu"
+        and statement.dtype is not None
+        and statement.dtype.name == "f32"
+        and len(statement.args) == 1
+    ):
+        source = context.value_registers[statement.args[0]]
+        result = context.allocate_value(statement.name, "f32")
+        context.emit(f"max.f32 {result}, {source}, 0f00000000;")
+        return
+
+    if (
+        statement.op.name not in ("add", "multiply")
         or statement.dtype is None
         or statement.dtype.name != "f32"
         or len(statement.args) != 2
     ):
-        raise NotImplementedError("Only binary f32 add assignments are supported")
+        raise NotImplementedError("Only binary f32 add/mul assignments are supported")
 
     left = context.value_registers[statement.args[0]]
     right = context.value_registers[statement.args[1]]
     result = context.allocate_value(statement.name, "f32")
-    context.emit(f"add.f32 {result}, {left}, {right};")
+    instruction = {
+        "add": "add.f32",
+        "multiply": "mul.f32",
+    }[statement.op.name]
+    context.emit(f"{instruction} {result}, {left}, {right};")
 
 
 def emit_write(statement: Write, context: KernelContext) -> None:
@@ -137,11 +152,11 @@ def emit_write(statement: Write, context: KernelContext) -> None:
         statement.atomic
         or statement.swizzle != "NONE"
         or len(statement.index) != 1
-        or len(statement.values) not in (1, 2)
+        or len(statement.values) not in (1, 2, 4)
         or statement.value_dtype is None
         or statement.value_dtype.name != "f32"
     ):
-        raise NotImplementedError("Only plain 1-D f32 scalar/pair writes are supported")
+        raise NotImplementedError("Only plain 1-D f32 writes of 1, 2, or 4 values are supported")
 
     index = emit_index(statement.index[0], context)
     address = emit_address(
@@ -151,8 +166,9 @@ def emit_write(statement: Write, context: KernelContext) -> None:
     if len(values) == 1:
         context.emit(f"st.global.f32 [{address}], {values[0]};")
     else:
+        width = len(values)
         operands = ", ".join(values)
-        context.emit(f"st.global.v2.f32 [{address}], {{{operands}}};")
+        context.emit(f"st.global.v{width}.f32 [{address}], {{{operands}}};")
 
 
 def emit_statement(statement, context: KernelContext) -> None:
