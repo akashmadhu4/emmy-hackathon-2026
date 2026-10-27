@@ -7,8 +7,8 @@ from pathlib import Path
 
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.kernel.ir import KernelOp, Tile
-from emmy.compiler.ir.loop import Assign, Load, Write
+from emmy.compiler.ir.kernel.ir import KernelOp, StridedLoop, Tile
+from emmy.compiler.ir.loop import Accum, Assign, Load, Write
 
 
 def load_graph(path: Path) -> Graph:
@@ -50,9 +50,15 @@ class KernelContext:
         self.instructions: list[str] = []
         self.value_registers: dict[str, str] = {}
         self.axis_registers: dict[str, str] = {}
+        self.label_count = 0
 
     def emit(self, instruction: str) -> None:
         self.instructions.append(instruction)
+
+    def new_label(self, prefix: str) -> str:
+        label = f"{prefix}_{self.label_count}"
+        self.label_count += 1
+        return label
 
     def declare(self, declaration: str) -> None:
         self.declarations.append(declaration)
@@ -171,7 +177,77 @@ def emit_write(statement: Write, context: KernelContext) -> None:
         context.emit(f"st.global.v{width}.f32 [{address}], {{{operands}}};")
 
 
+def emit_strided_loop(statement: StridedLoop, context: KernelContext) -> None:
+    if not statement.seed:
+        raise NotImplementedError("Unseeded strided loops are not supported yet")
+    if (
+        not isinstance(statement.step, Literal)
+        or statement.step.dtype != "int"
+        or statement.step.value <= 0
+    ):
+        raise NotImplementedError("Only positive integer literal loop steps are supported")
+    accumulators = [
+        child for child in statement.body if isinstance(child, Accum)
+    ]
+    for accumulator in accumulators:
+        if (
+            accumulator.op.name != "add"
+            or accumulator.dtype is None
+            or accumulator.dtype.name != "f32"
+            or accumulator.base is not None
+        ):
+            raise NotImplementedError("Only zero-based f32 sum accumulators are supported")
+        register = context.allocate_value(accumulator.name, "f32")
+        context.emit(f"mov.f32 {register}, 0f00000000;")
+    start = emit_index(statement.start, context)
+    index = context.new_register("u32")
+    context.emit(f"mov.u32 {index}, {start};")
+    previous_axis = context.axis_registers.get(statement.axis.name)
+    context.axis_registers[statement.axis.name] = index
+    loop_start = context.new_label("LOOP_START")
+    loop_end = context.new_label("LOOP_END")
+    done = context.new_register("pred")
+    end = (
+        emit_index(statement.end, context)
+        if statement.end is not None
+        else str(statement.axis.extent.value)
+    )
+    step = emit_index(statement.step, context)
+    context.emit(f"{loop_start}:")
+    context.emit(f"setp.ge.u32 {done}, {index}, {end};")
+    context.emit(f"@{done} bra {loop_end};")
+    for child in statement.body:
+        emit_statement(child, context)
+    context.emit(f"add.u32 {index}, {index}, {step};")
+    context.emit(f"bra {loop_start};")
+    context.emit(f"{loop_end}:")
+    if previous_axis is None:
+        del context.axis_registers[statement.axis.name]
+    else:
+        context.axis_registers[statement.axis.name] = previous_axis
+
+
+def emit_accum(statement: Accum, context: KernelContext) -> None:
+    if (
+        statement.op.name != "add"
+        or statement.dtype is None
+        or statement.dtype.name != "f32"
+        or statement.base is not None
+    ):
+        raise NotImplementedError("Only zero-based f32 sum accumulators are supported")
+
+    accumulator = context.value_registers[statement.name]
+    value = context.value_registers[statement.value]
+    context.emit(f"add.f32 {accumulator}, {accumulator}, {value};")
+
+
 def emit_statement(statement, context: KernelContext) -> None:
+    if isinstance(statement, StridedLoop):
+        emit_strided_loop(statement, context)
+        return
+    if isinstance(statement, Accum):
+        emit_accum(statement, context)
+        return
     if isinstance(statement, Load):
         emit_load(statement, context)
         return
