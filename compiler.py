@@ -7,8 +7,8 @@ from pathlib import Path
 
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.kernel.ir import KernelOp, StridedLoop, Tile
-from emmy.compiler.ir.loop import Accum, Assign, Load, Write
+from emmy.compiler.ir.kernel.ir import KernelOp, Smem, StridedLoop, Sync, Tile, TreeHalve, WarpShuffle
+from emmy.compiler.ir.loop import Accum, Assign, Cond, Load, Write
 
 
 def load_graph(path: Path) -> Graph:
@@ -50,6 +50,8 @@ class KernelContext:
         self.instructions: list[str] = []
         self.value_registers: dict[str, str] = {}
         self.axis_registers: dict[str, str] = {}
+        self.shared_buffers: dict[str, tuple[int, ...]] = {}
+        self.buffer_shapes: dict[str, tuple[int, ...]] = {}
         self.label_count = 0
 
     def emit(self, instruction: str) -> None:
@@ -96,6 +98,26 @@ def emit_index(expression, context: KernelContext) -> str:
     )
 
 
+def emit_flat_index(buffer: str, indices, context: KernelContext) -> str:
+    shape = (
+        context.shared_buffers[buffer]
+        if buffer in context.shared_buffers
+        else context.buffer_shapes[buffer]
+    )
+    if len(indices) != len(shape):
+        raise NotImplementedError("Index rank must match buffer rank")
+    if not indices:
+        return "0"
+
+    offset = emit_index(indices[0], context)
+    for extent, coordinate in zip(shape[1:], indices[1:]):
+        value = emit_index(coordinate, context)
+        result = context.new_register("u32")
+        context.emit(f"mad.lo.u32 {result}, {offset}, {extent}, {value};")
+        offset = result
+    return offset
+
+
 def emit_address(
     buffer: str, index: str, element_bytes: int, context: KernelContext
 ) -> str:
@@ -106,16 +128,27 @@ def emit_address(
     return address
 
 
+def emit_shared_address(
+    buffer: str, index: str, context: KernelContext
+) -> str:
+    base = context.new_register("u32")
+    offset = context.new_register("u32")
+    address = context.new_register("u32")
+    context.emit(f"mov.u32 {base}, {buffer};")
+    context.emit(f"mul.lo.u32 {offset}, {index}, 4;")
+    context.emit(f"add.u32 {address}, {base}, {offset};")
+    return address
+
+
 def emit_load(statement: Load, context: KernelContext) -> None:
     if (
         len(statement.names) != 1
-        or len(statement.index) != 1
         or statement.dtype is None
         or statement.dtype.name != "f32"
     ):
-        raise NotImplementedError("Only scalar 1-D f32 loads are supported")
+        raise NotImplementedError("Only scalar f32 global loads are supported")
 
-    index = emit_index(statement.index[0], context)
+    index = emit_flat_index(statement.input, statement.index, context)
     address = emit_address(
         statement.input, index, statement.dtype.nbytes, context
     )
@@ -136,12 +169,12 @@ def emit_assign(statement: Assign, context: KernelContext) -> None:
         return
 
     if (
-        statement.op.name not in ("add", "multiply")
+        statement.op.name not in ("add", "multiply", "divide")
         or statement.dtype is None
         or statement.dtype.name != "f32"
         or len(statement.args) != 2
     ):
-        raise NotImplementedError("Only binary f32 add/mul assignments are supported")
+        raise NotImplementedError("Only binary f32 add/multiply/divide assignments are supported")
 
     left = context.value_registers[statement.args[0]]
     right = context.value_registers[statement.args[1]]
@@ -149,6 +182,7 @@ def emit_assign(statement: Assign, context: KernelContext) -> None:
     instruction = {
         "add": "add.f32",
         "multiply": "mul.f32",
+        "divide": "div.rn.f32",
     }[statement.op.name]
     context.emit(f"{instruction} {result}, {left}, {right};")
 
@@ -157,24 +191,33 @@ def emit_write(statement: Write, context: KernelContext) -> None:
     if (
         statement.atomic
         or statement.swizzle != "NONE"
-        or len(statement.index) != 1
+        or len(statement.index) not in (0, 1)
         or len(statement.values) not in (1, 2, 4)
         or statement.value_dtype is None
         or statement.value_dtype.name != "f32"
     ):
-        raise NotImplementedError("Only plain 1-D f32 writes of 1, 2, or 4 values are supported")
+        raise NotImplementedError("Only plain scalar/1-D f32 writes of 1, 2, or 4 values are supported")
 
-    index = emit_index(statement.index[0], context)
-    address = emit_address(
-        statement.output, index, statement.value_dtype.nbytes, context
+    index = (
+        emit_index(statement.index[0], context)
+        if statement.index
+        else "0"
     )
+    if statement.output in context.shared_buffers:
+        address = emit_shared_address(statement.output, index, context)
+        space = "shared"
+    else:
+        address = emit_address(
+            statement.output, index, statement.value_dtype.nbytes, context
+        )
+        space = "global"
     values = [context.value_registers[name] for name in statement.values]
     if len(values) == 1:
-        context.emit(f"st.global.f32 [{address}], {values[0]};")
+        context.emit(f"st.{space}.f32 [{address}], {values[0]};")
     else:
         width = len(values)
         operands = ", ".join(values)
-        context.emit(f"st.global.v{width}.f32 [{address}], {{{operands}}};")
+        context.emit(f"st.{space}.v{width}.f32 [{address}], {{{operands}}};")
 
 
 def emit_strided_loop(statement: StridedLoop, context: KernelContext) -> None:
@@ -241,7 +284,175 @@ def emit_accum(statement: Accum, context: KernelContext) -> None:
     context.emit(f"add.f32 {accumulator}, {accumulator}, {value};")
 
 
+def emit_warp_shuffle(statement: WarpShuffle, context: KernelContext) -> None:
+    if (
+        statement.dtype is None
+        or statement.dtype.name != "f32"
+        or statement.length not in (1, 2, 4, 8, 16, 32)
+        or len(statement.state) != 1
+        or len(statement.state_b) != 1
+        or len(statement.combine_states) != 1
+    ):
+        raise NotImplementedError("Only single-state f32 warp sums are supported")
+
+    combine = statement.combine_states[0]
+    if not (
+        isinstance(combine, Assign)
+        and combine.op.name == "add"
+        and combine.name == statement.state[0]
+        and combine.args == (statement.state[0], statement.state_b[0])
+    ):
+        raise NotImplementedError("Only additive warp combines are supported")
+
+    accumulator = context.value_registers[statement.state[0]]
+    send_bits = context.new_register("b32")
+    received_bits = context.new_register("b32")
+    partner = context.new_register("f32")
+    offset = statement.length // 2
+    while offset > 0:
+        context.emit(f"mov.b32 {send_bits}, {accumulator};")
+        context.emit(
+            f"shfl.sync.bfly.b32 {received_bits}, {send_bits}, "
+            f"{offset}, 0x1f, 0xffffffff;"
+        )
+        context.emit(f"mov.b32 {partner}, {received_bits};")
+        context.emit(f"add.f32 {accumulator}, {accumulator}, {partner};")
+        offset //= 2
+
+
+def emit_smem(statement: Smem, context: KernelContext) -> None:
+    if statement.dtype != "float":
+        raise NotImplementedError("Only f32 shared buffers are supported")
+
+    elements = 1
+    for extent in statement.extents:
+        elements *= extent
+
+    alignment = statement.align or 4
+    context.declare(
+        f".shared .align {alignment} .b8 {statement.name}[{elements * 4}];"
+    )
+    context.shared_buffers[statement.name] = tuple(statement.extents)
+
+
+def emit_warp_coordinates(context: KernelContext) -> None:
+    lane = context.new_register("u32")
+    warp = context.new_register("u32")
+    context.emit(f"and.b32 {lane}, %thread_linear, 31;")
+    context.emit(f"shr.u32 {warp}, %thread_linear, 5;")
+    context.axis_registers["lane"] = lane
+    context.axis_registers["warp"] = warp
+
+
+def emit_predicate(expression, context: KernelContext) -> str:
+    if isinstance(expression, BinaryExpr) and expression.op == "==":
+        left = emit_index(expression.left, context)
+        right = emit_index(expression.right, context)
+        predicate = context.new_register("pred")
+        context.emit(f"setp.eq.u32 {predicate}, {left}, {right};")
+        return predicate
+    raise NotImplementedError(
+        f"Unsupported predicate: {type(expression).__name__}"
+    )
+
+
+def emit_cond(statement: Cond, context: KernelContext) -> None:
+    if statement.else_body:
+        raise NotImplementedError("Conditional else branches are not supported yet")
+
+    predicate = emit_predicate(statement.cond, context)
+    end = context.new_label("COND_END")
+    context.emit(f"@!{predicate} bra {end};")
+    for child in statement.body:
+        emit_statement(child, context)
+    context.emit(f"{end}:")
+
+
+def emit_sync(statement: Sync, context: KernelContext) -> None:
+    if statement.warp or statement.count is not None:
+        raise NotImplementedError("Only full-block barriers are supported")
+    context.emit(f"bar.sync {statement.barrier_id};")
+
+
+def emit_tree_halve(statement: TreeHalve, context: KernelContext) -> None:
+    length = statement.length
+    if (
+        length < 1
+        or length & (length - 1)
+        or statement.dtype is None
+        or statement.dtype.name != "f32"
+        or len(statement.bufs) != 1
+        or len(statement.state) != 1
+        or len(statement.state_b) != 1
+        or len(statement.combine_states) != 1
+        or statement.barrier_count is not None
+        or statement.inner is not None
+    ):
+        raise NotImplementedError("Only single-state f32 block tree sums are supported")
+
+    combine = statement.combine_states[0]
+    if not (
+        isinstance(combine, Assign)
+        and combine.op.name == "add"
+        and combine.name == statement.state[0]
+        and combine.args == (statement.state[0], statement.state_b[0])
+    ):
+        raise NotImplementedError("Only additive tree combines are supported")
+
+    buffer = statement.bufs[0]
+    if context.shared_buffers.get(buffer) != (statement.length,):
+        raise NotImplementedError("Tree sum requires a matching 1-D shared buffer")
+
+    tid = context.axis_registers[statement.tid_var]
+    accumulator = context.value_registers[statement.state[0]]
+    partner = context.new_register("f32")
+    if statement.tid_var != "warp":
+        raise NotImplementedError("Only warp-indexed tree sums are supported")
+
+    lane = context.axis_registers["lane"]
+    skip = context.new_register("pred")
+    stride = statement.length // 2
+    while stride > 0:
+        stage_end = context.new_label("TREE_STAGE_END")
+        context.emit(f"setp.ne.u32 {skip}, {lane}, 0;")
+        context.emit(f"@{skip} bra {stage_end};")
+        context.emit(f"setp.ge.u32 {skip}, {tid}, {stride};")
+        context.emit(f"@{skip} bra {stage_end};")
+
+        partner_index = context.new_register("u32")
+        context.emit(f"add.u32 {partner_index}, {tid}, {stride};")
+        left_address = emit_shared_address(buffer, tid, context)
+        right_address = emit_shared_address(buffer, partner_index, context)
+
+        context.emit(f"ld.shared.f32 {accumulator}, [{left_address}];")
+        context.emit(f"ld.shared.f32 {partner}, [{right_address}];")
+        context.emit(f"add.f32 {accumulator}, {accumulator}, {partner};")
+        context.emit(f"st.shared.f32 [{left_address}], {accumulator};")
+
+        context.emit(f"{stage_end}:")
+        context.emit(f"bar.sync {statement.barrier_id};")
+        stride //= 2
+
+    result_address = emit_shared_address(buffer, "0", context)
+    context.emit(f"ld.shared.f32 {accumulator}, [{result_address}];")
+
+
 def emit_statement(statement, context: KernelContext) -> None:
+    if isinstance(statement, TreeHalve):
+        emit_tree_halve(statement, context)
+        return
+    if isinstance(statement, Sync):
+        emit_sync(statement, context)
+        return
+    if isinstance(statement, Cond):
+        emit_cond(statement, context)
+        return
+    if isinstance(statement, Smem):
+        emit_smem(statement, context)
+        return
+    if isinstance(statement, WarpShuffle):
+        emit_warp_shuffle(statement, context)
+        return
     if isinstance(statement, StridedLoop):
         emit_strided_loop(statement, context)
         return
@@ -275,6 +486,11 @@ def main() -> None:
         if isinstance(node.op, KernelOp):
             kernel = node.op
             context = KernelContext()
+            for graph_node in graph.nodes.values():
+                for tensor in graph_node.outputs:
+                    context.buffer_shapes[tensor.name] = tuple(
+                        dimension.value for dimension in tensor.shape
+                    )
             kernel_meta = next(
                 entry for entry in metadata["kernels"]
                 if entry["entry"] == kernel.name
@@ -315,6 +531,7 @@ def main() -> None:
                 context.emit(f"mov.u32 %grid_size_{axis}, %nctaid.{axis};")
             context.emit("mad.lo.u32 %thread_linear, %block_size_y, %thread_z, %thread_y;")
             context.emit("mad.lo.u32 %thread_linear, %block_size_x, %thread_linear, %thread_x;")
+            emit_warp_coordinates(context)
             context.emit("mad.lo.u32 %block_linear, %grid_size_y, %block_z, %block_y;")
             context.emit("mad.lo.u32 %block_linear, %grid_size_x, %block_linear, %block_x;")
             context.emit("mul.lo.u32 %threads_per_block, %block_size_x, %block_size_y;")
